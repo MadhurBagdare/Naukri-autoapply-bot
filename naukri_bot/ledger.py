@@ -1,0 +1,345 @@
+"""Persistent application and screening-answer ledger."""
+
+# noqa: SIZE_OK - the requested Ledger contract is an indivisible persistence unit.
+
+import csv
+import json
+import logging
+import os
+import sqlite3
+import string
+import threading
+from datetime import datetime, timedelta, timezone
+from types import TracebackType
+from typing import Any, Dict, List, Optional, Type
+
+from .models import Answer, AnswerSource, ApplyResult, ApplyStatus, JobPosting, Settings
+
+
+logger = logging.getLogger(__name__)
+
+
+class LedgerExportError(ValueError):
+    """Raised when an export would overwrite the ledger database."""
+
+
+def _now() -> str:
+    """Return the current time as a UTC ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalise_question(text: str) -> str:
+    """Create the exact-match cache key for a screening question."""
+    collapsed = " ".join(text.lower().split())
+    return collapsed.rstrip(string.punctuation).rstrip()
+
+
+class Ledger:
+    """Own the durable SQLite state shared by all bot runs."""
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.RLock()
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        try:
+            self._connection = sqlite3.connect(
+                db_path,
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+                check_same_thread=False,
+            )
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._migrate()
+        except sqlite3.Error:
+            logger.exception("failed to open ledger database at %s", db_path)
+            raise
+
+    def _migrate(self) -> None:
+        """Create the ledger schema if it does not already exist."""
+        try:
+            with self._lock, self._connection:
+                self._connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS jobs_seen(
+                        job_id TEXT PRIMARY KEY, url TEXT, title TEXT,
+                        company TEXT, source TEXT, first_seen TEXT,
+                        last_seen TEXT, score REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS applications(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT,
+                        url TEXT, title TEXT, company TEXT, status TEXT,
+                        detail TEXT, quota_consumed INTEGER,
+                        questions_answered INTEGER, questions_abstained INTEGER,
+                        at TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_applications_job_id
+                        ON applications(job_id);
+                    CREATE INDEX IF NOT EXISTS idx_applications_at
+                        ON applications(at);
+                    CREATE TABLE IF NOT EXISTS answers(
+                        question_norm TEXT PRIMARY KEY, question_text TEXT,
+                        answer TEXT, field_type TEXT, grounded_in TEXT,
+                        source TEXT, confidence REAL, created_at TEXT,
+                        updated_at TEXT, times_used INTEGER DEFAULT 0
+                    );
+                    CREATE TABLE IF NOT EXISTS runs(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT,
+                        finished_at TEXT, collected INTEGER, ranked INTEGER,
+                        attempted INTEGER, applied INTEGER, summary_json TEXT
+                    );
+                    """
+                )
+        except sqlite3.Error:
+            logger.exception("failed to migrate ledger database")
+            raise
+
+    def has_applied(self, job_id: str) -> bool:
+        try:
+            with self._lock:
+                row = self._connection.execute(
+                    "SELECT 1 FROM applications WHERE job_id = ? AND status = ? LIMIT 1",
+                    (job_id, ApplyStatus.APPLIED),
+                ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            logger.exception("failed to check applied status for job %s", job_id)
+            raise
+
+    def attempt_count(self, job_id: str) -> int:
+        try:
+            with self._lock:
+                row = self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM applications WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            return int(row["count"])
+        except sqlite3.Error:
+            logger.exception("failed to count attempts for job %s", job_id)
+            raise
+
+    def seen_before(self, job_id: str) -> bool:
+        try:
+            with self._lock:
+                row = self._connection.execute(
+                    "SELECT 1 FROM jobs_seen WHERE job_id = ? LIMIT 1", (job_id,)
+                ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            logger.exception("failed to check seen status for job %s", job_id)
+            raise
+
+    def record_seen(self, job: JobPosting, score: Optional[float] = None) -> None:
+        seen_at = _now()
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """INSERT INTO jobs_seen(
+                           job_id, url, title, company, source, first_seen, last_seen, score
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(job_id) DO UPDATE SET
+                           last_seen = excluded.last_seen,
+                           score = COALESCE(excluded.score, score)""",
+                    (
+                        job.job_id, job.url, job.title, job.company, job.source,
+                        seen_at, seen_at, score,
+                    ),
+                )
+        except sqlite3.Error:
+            logger.exception("failed to record seen job %s", job.job_id)
+            raise
+
+    def record_attempt(
+        self, result: ApplyResult, title: str = "", company: str = ""
+    ) -> None:
+        if (result.status == ApplyStatus.APPLIED) != result.quota_consumed:
+            logger.warning(
+                "inconsistent application result for job %s: status=%s, quota_consumed=%s",
+                result.job_id,
+                result.status,
+                result.quota_consumed,
+            )
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """INSERT INTO applications(
+                           job_id, url, title, company, status, detail,
+                           quota_consumed, questions_answered,
+                           questions_abstained, at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        result.job_id, result.url, title, company, result.status,
+                        result.detail, int(result.quota_consumed),
+                        result.questions_answered, result.questions_abstained, _now(),
+                    ),
+                )
+        except sqlite3.Error:
+            logger.exception("failed to record attempt for job %s", result.job_id)
+            raise
+
+    def quota_used(self, window_hours: int = 24) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+        try:
+            with self._lock:
+                row = self._connection.execute(
+                    """SELECT COUNT(*) AS count FROM applications
+                       WHERE quota_consumed = ? AND at >= ?""",
+                    (1, cutoff),
+                ).fetchone()
+            return int(row["count"])
+        except sqlite3.Error:
+            logger.exception("failed to calculate quota used")
+            raise
+
+    def quota_remaining(self, daily_quota: int = 50, window_hours: int = 24) -> int:
+        return max(0, daily_quota - self.quota_used(window_hours))
+
+    def recent_applications(self, limit: int = 50) -> List[Dict[str, Any]]:
+        try:
+            with self._lock:
+                rows = self._connection.execute(
+                    "SELECT * FROM applications ORDER BY at DESC, id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error:
+            logger.exception("failed to list recent applications")
+            raise
+
+    def get_answer(self, question_text: str) -> Optional[Answer]:
+        question_norm = _normalise_question(question_text)
+        try:
+            with self._lock, self._connection:
+                row = self._connection.execute(
+                    """SELECT answer, grounded_in, confidence FROM answers
+                       WHERE question_norm = ?""",
+                    (question_norm,),
+                ).fetchone()
+                if row is None:
+                    return None
+                self._connection.execute(
+                    "UPDATE answers SET times_used = times_used + 1 WHERE question_norm = ?",
+                    (question_norm,),
+                )
+            return Answer(
+                text=row["answer"],
+                grounded_in=row["grounded_in"],
+                source=AnswerSource.CACHE,
+                confidence=float(row["confidence"]),
+            )
+        except sqlite3.Error:
+            logger.exception("failed to get cached answer")
+            raise
+
+    def save_answer(
+        self, question_text: str, answer: Answer, field_type: str = "text"
+    ) -> None:
+        question_norm = _normalise_question(question_text)
+        saved_at = _now()
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """INSERT INTO answers(
+                           question_norm, question_text, answer, field_type,
+                           grounded_in, source, confidence, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(question_norm) DO UPDATE SET
+                           question_text = excluded.question_text,
+                           answer = excluded.answer,
+                           field_type = excluded.field_type,
+                           grounded_in = excluded.grounded_in,
+                           source = excluded.source,
+                           confidence = excluded.confidence,
+                           updated_at = excluded.updated_at""",
+                    (
+                        question_norm, question_text, answer.text, field_type,
+                        answer.grounded_in, answer.source, answer.confidence,
+                        saved_at, saved_at,
+                    ),
+                )
+        except sqlite3.Error:
+            logger.exception("failed to save cached answer")
+            raise
+
+    def start_run(self) -> int:
+        try:
+            with self._lock, self._connection:
+                cursor = self._connection.execute(
+                    "INSERT INTO runs(started_at) VALUES (?)", (_now(),)
+                )
+                run_id = cursor.lastrowid
+            if run_id is None:
+                raise sqlite3.DatabaseError("run insert did not return an id")
+            return run_id
+        except sqlite3.Error:
+            logger.exception("failed to start run")
+            raise
+
+    def finish_run(self, run_id: int, summary: Dict[str, Any]) -> None:
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """UPDATE runs SET finished_at = ?, collected = ?, ranked = ?,
+                           attempted = ?, applied = ?, summary_json = ? WHERE id = ?""",
+                    (
+                        _now(), summary.get("collected", 0), summary.get("ranked", 0),
+                        summary.get("attempted", 0), summary.get("applied", 0),
+                        json.dumps(summary, sort_keys=True), run_id,
+                    ),
+                )
+        except sqlite3.Error:
+            logger.exception("failed to finish run %s", run_id)
+            raise
+
+    def export_csv(self, path: str) -> None:
+        export_path = os.path.abspath(path)
+        database_path = os.path.abspath(self._db_path)
+        overwrites_database = self._db_path != ":memory:" and (
+            export_path == database_path
+            or (
+                os.path.exists(export_path)
+                and os.path.exists(database_path)
+                and os.path.samefile(export_path, database_path)
+            )
+        )
+        if overwrites_database:
+            raise LedgerExportError("CSV export path is the ledger database")
+        try:
+            with self._lock:
+                cursor = self._connection.execute(
+                    "SELECT * FROM applications ORDER BY id ASC"
+                )
+                rows = cursor.fetchall()
+                fieldnames = [column[0] for column in cursor.description]
+        except sqlite3.Error:
+            logger.exception("failed to read applications for CSV export")
+            raise
+        parent = os.path.dirname(export_path)
+        os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(dict(row) for row in rows)
+
+    def close(self) -> None:
+        try:
+            with self._lock:
+                self._connection.close()
+        except sqlite3.Error:
+            logger.exception("failed to close ledger database")
+            raise
+
+    def __enter__(self) -> "Ledger":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.close()
+
+
+def open_ledger(settings: Settings) -> Ledger:
+    return Ledger(settings.db_path)

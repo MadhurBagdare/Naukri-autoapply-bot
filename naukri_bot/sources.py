@@ -1,0 +1,393 @@
+"""Collect job candidates from Naukri search and recommended feeds."""
+
+import hashlib
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urlencode, urlsplit
+
+from bs4 import BeautifulSoup
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from .browser import human_pause, safe_get
+from .models import JobPosting, Settings
+
+
+logger = logging.getLogger(__name__)
+
+_SEARCH_CARD_SELECTORS = (
+    "div.srp-jobtuple-wrapper",
+    "div.cust-job-tuple",
+    "article.jobTuple",
+)
+_RECOMMENDED_CARD_SELECTORS = (
+    "div.srp-jobtuple-wrapper",
+    "div.cust-job-tuple",
+    "[class*='job-tuple']",
+    ".recommended-jobs-list > div",
+    "article.jobTuple",
+)
+
+
+def job_id_from_url(url: str) -> str:
+    """Return a stable job identifier derived from a Naukri URL."""
+    path = unquote(urlsplit(url).path)
+    normalised_path = re.sub(r"/+", "/", path).rstrip("/") or "/"
+    numeric_id = re.search(r"(?:-|/)(\d+)$", normalised_path)
+    if numeric_id:
+        return numeric_id.group(1)
+    return hashlib.sha1(normalised_path.encode("utf-8")).hexdigest()[:16]
+
+
+def parse_posted_days(label: str) -> Optional[float]:
+    """Translate a recognised Naukri freshness label to days."""
+    value = " ".join(label.strip().lower().split())
+    if not value:
+        return None
+    if value in ("just now", "few hours ago", "today"):
+        return 0.0
+
+    day_match = re.fullmatch(r"(\d+)\+? days? ago", value)
+    if day_match:
+        return float(day_match.group(1))
+
+    week_match = re.fullmatch(r"(\d+)\+? weeks? ago", value)
+    if week_match:
+        return float(int(week_match.group(1)) * 7)
+
+    month_match = re.fullmatch(r"(\d+)\+? months? ago", value)
+    if month_match:
+        return float(int(month_match.group(1)) * 30)
+
+    if value in ("a month ago", "a week ago"):
+        return 30.0 if "month" in value else 7.0
+    return None
+
+
+def _first(card: Any, selectors: Tuple[str, ...], field: str) -> Optional[Any]:
+    for selector in selectors:
+        try:
+            element = card.select_one(selector)
+        except AttributeError as exc:
+            logger.debug("Could not parse %s with %s: %s", field, selector, exc)
+            continue
+        if element is not None:
+            return element
+    return None
+
+
+def _text(card: Any, selectors: Tuple[str, ...], field: str) -> str:
+    element = _first(card, selectors, field)
+    if element is None:
+        return ""
+    try:
+        return element.get_text(" ", strip=True)
+    except AttributeError as exc:
+        logger.debug("Could not read %s text: %s", field, exc)
+        return ""
+
+
+def _tags(card: Any) -> List[str]:
+    try:
+        elements = card.select("ul.tags-gt li")
+    except AttributeError as exc:
+        logger.debug("Could not parse tags: %s", exc)
+        return []
+
+    tags: List[str] = []
+    for element in elements:
+        try:
+            text = element.get_text(" ", strip=True)
+        except AttributeError as exc:
+            logger.debug("Could not read a tag: %s", exc)
+            continue
+        if text:
+            tags.append(text)
+    return tags
+
+
+def _parse_cards(cards: List[Any], source: str) -> List[JobPosting]:
+    jobs: List[JobPosting] = []
+    missing_title = 0
+    missing_href = 0
+    for index, card in enumerate(cards, 1):
+        title_link = _first(card, ("h2 a.title", "a.title"), "title link")
+        title = ""
+        href = ""
+        if title_link is not None:
+            try:
+                title = title_link.get_text(" ", strip=True)
+            except AttributeError as exc:
+                logger.debug("Could not read title on card %d: %s", index, exc)
+            try:
+                href = title_link.get("href", "") or ""
+            except AttributeError as exc:
+                logger.debug("Could not read href on card %d: %s", index, exc)
+        if not title:
+            missing_title += 1
+            logger.debug("Skipping %s card %d: title is missing", source, index)
+            continue
+        if not href:
+            missing_href += 1
+            logger.debug("Skipping %s card %d: href is missing", source, index)
+            continue
+        if href.startswith("/"):
+            href = "https://www.naukri.com" + href
+
+        posted_label = _text(
+            card, ("span.job-post-day", "[class*='job-post-day']"), "posted label"
+        )
+        jobs.append(
+            JobPosting(
+                job_id=job_id_from_url(href),
+                url=href,
+                title=title,
+                company=_text(card, ("a.comp-name", "[class*='comp-name']"), "company"),
+                experience=_text(card, ("span.expwdth", "[class*='exp']"), "experience"),
+                salary=_text(card, ("span.sal", "[class*='sal']"), "salary"),
+                location=_text(card, ("span.locWdth", "[class*='loc']"), "location"),
+                description=_text(
+                    card, ("span.job-desc", "[class*='job-desc']"), "description"
+                ),
+                tags=_tags(card),
+                posted_label=posted_label,
+                posted_days_ago=parse_posted_days(posted_label),
+                source=source,
+            )
+        )
+    if missing_title or missing_href:
+        logger.warning(
+            "%s: dropped %d of %d cards (%d without a title, %d without a job "
+            "URL). If this is every card, Naukri's card markup has changed.",
+            source,
+            missing_title + missing_href,
+            len(cards),
+            missing_title,
+            missing_href,
+        )
+    return jobs
+
+
+def _matching_cards(soup: BeautifulSoup, selectors: Tuple[str, ...]) -> Tuple[List[Any], str]:
+    for selector in selectors:
+        cards = list(soup.select(selector))
+        if cards:
+            return cards, selector
+    return [], selectors[-1]
+
+
+def _search_url(keyword: str, location: str, page: int, sort_by_date: bool) -> str:
+    """Build a Naukri search URL using the query endpoint.
+
+    An earlier version built SEO slug paths like ``/llm-engineer-jobs``.  Those
+    landing pages only exist for a curated set of popular terms, so niche
+    keywords 404 - and a 404 still loads cleanly in Selenium, which means the
+    only visible symptom is "zero cards".  ``/jobs-in-india?k=...`` is the real
+    search endpoint; Naukri server-redirects it to whatever slug it considers
+    canonical for that keyword.
+    """
+    params = [("k", keyword)]
+    if location:
+        params.append(("l", location))
+    if sort_by_date:
+        params.append(("sort", "f"))
+    if page > 1:
+        params.append(("pageNo", str(page)))
+    query = urlencode(params, quote_via=quote)
+    return "https://www.naukri.com/jobs-in-india?%s" % query
+
+
+def collect_from_search(
+    driver, keyword: str, location: str = "", pages: int = 3, sort_by_date: bool = True
+) -> List[JobPosting]:
+    """Collect job cards from date-sorted Naukri search pages."""
+    jobs: List[JobPosting] = []
+    for page in range(1, max(0, pages) + 1):
+        url = _search_url(keyword, location, page, sort_by_date)
+        if page > 1:
+            human_pause()
+        try:
+            if not safe_get(driver, url):
+                logger.warning("Could not navigate to search page %s", url)
+                break
+            # Naukri renders search results client-side.  driver.get() returns
+            # as soon as the shell document is ready, so reading page_source
+            # right away finds an empty results container - which is
+            # indistinguishable from "this search has no matches".  Wait for a
+            # card to actually exist before parsing.
+            try:
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, ", ".join(_SEARCH_CARD_SELECTORS))
+                    )
+                )
+            except TimeoutException:
+                logger.warning(
+                    "No job cards rendered within 20s on %s - either this search "
+                    "genuinely has no matches, or the card markup changed.",
+                    url,
+                )
+                break
+            soup = BeautifulSoup(driver.page_source, "html5lib")
+        except TimeoutException as exc:
+            logger.warning("Timed out loading search page %s: %s", url, exc)
+            break
+        except WebDriverException as exc:
+            logger.warning("WebDriver failed on search page %s: %s", url, exc)
+            break
+        except AttributeError as exc:
+            logger.warning("Could not read search page %s: %s", url, exc)
+            break
+
+        cards, selector = _matching_cards(soup, _SEARCH_CARD_SELECTORS)
+        if not cards:
+            logger.warning("Search page yielded zero cards: %s", url)
+            break
+        logger.info("Search page %s matched %s (%d cards)", url, selector, len(cards))
+        jobs.extend(_parse_cards(cards, "search:%s" % keyword))
+    return jobs
+
+
+def _active_tab_id(driver) -> str:
+    selectors = ".tab-list-item.active, .tab-list-item[aria-selected='true']"
+    try:
+        active = driver.find_elements(By.CSS_SELECTOR, selectors)
+        if not active:
+            return "default (unidentified)"
+        tab_id = driver.execute_script(
+            "var n=arguments[0]; while(n && !n.id){n=n.parentElement;} return n && n.id;",
+            active[0],
+        )
+        return str(tab_id) if tab_id else "default (unidentified)"
+    except (WebDriverException, AttributeError) as exc:
+        logger.warning("Could not identify the active recommended tab: %s", exc)
+        return "default (unidentified)"
+
+
+def collect_from_recommended(
+    driver, tab_id: str = "top_candidate", max_pages: int = 3
+) -> List[JobPosting]:
+    """Collect cards from a recommended-jobs tab, including lazy-loaded cards."""
+    url = "https://www.naukri.com/mnjuser/recommendedjobs"
+    try:
+        if not safe_get(driver, url):
+            logger.warning("Could not navigate to recommended jobs at %s", url)
+            return []
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".tab-list"))
+        )
+    except TimeoutException as exc:
+        logger.warning("Recommended tab list did not load at %s: %s", url, exc)
+    except WebDriverException as exc:
+        logger.warning("WebDriver failed loading recommended jobs at %s: %s", url, exc)
+        return []
+
+    requested_selector = "div#%s .tab-list-item" % tab_id
+    try:
+        requested_tabs = driver.find_elements(By.CSS_SELECTOR, requested_selector)
+        if requested_tabs:
+            requested_tabs[0].click()
+            human_pause()
+        else:
+            logger.warning(
+                "Recommended tab %s was not found; continuing on active tab %s",
+                tab_id,
+                _active_tab_id(driver),
+            )
+    except (WebDriverException, AttributeError) as exc:
+        logger.warning(
+            "Could not activate recommended tab %s; continuing on active tab %s: %s",
+            tab_id,
+            _active_tab_id(driver),
+            exc,
+        )
+    logger.info("Recommended feed active tab: %s (requested: %s)", _active_tab_id(driver), tab_id)
+
+    latest_cards: List[Any] = []
+    try:
+        soup = BeautifulSoup(driver.page_source, "html5lib")
+        latest_cards, selector = _matching_cards(soup, _RECOMMENDED_CARD_SELECTORS)
+        logger.info("Recommended selector %s matched %d cards", selector, len(latest_cards))
+        previous_count = len(latest_cards)
+        for _ in range(max(0, max_pages)):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+            human_pause()
+            soup = BeautifulSoup(driver.page_source, "html5lib")
+            cards, selector = _matching_cards(soup, _RECOMMENDED_CARD_SELECTORS)
+            logger.info("Recommended selector %s matched %d cards", selector, len(cards))
+            if len(cards) <= previous_count:
+                break
+            latest_cards = cards
+            previous_count = len(cards)
+    except TimeoutException as exc:
+        logger.warning("Timed out while loading recommended cards: %s", exc)
+    except WebDriverException as exc:
+        logger.warning("WebDriver failed while loading recommended cards: %s", exc)
+    except AttributeError as exc:
+        logger.warning("Could not parse recommended cards: %s", exc)
+
+    parsed = _parse_cards(latest_cards, "recommended:%s" % tab_id)
+    if latest_cards and not parsed:
+        logger.warning(
+            "Recommended feed yielded %d cards but no usable postings. Naukri's "
+            "recommended cards carry no job link: the title is an <a> without an "
+            "href, the company is a <span>, and the page contains no job id we "
+            "can turn into a URL - the feed navigates through a JavaScript click "
+            "handler instead. Keyword search is the working source; recommended "
+            "jobs are skipped.",
+            len(latest_cards),
+        )
+    return parsed
+
+
+def collect_candidates(
+    driver, settings: Settings, keywords: List[str], location: str = ""
+) -> List[JobPosting]:
+    """Collect and first-seen deduplicate recommended and search candidates."""
+    result: List[JobPosting] = []
+    seen = set()
+    breakdown: Dict[str, int] = {}
+
+    def add_unique(jobs: List[JobPosting], source: str) -> None:
+        breakdown.setdefault(source, 0)
+        for job in jobs:
+            if len(result) >= settings.max_candidates:
+                return
+            if job.job_id in seen:
+                continue
+            seen.add(job.job_id)
+            result.append(job)
+            breakdown[job.source] = breakdown.get(job.source, 0) + 1
+
+    recommended_source = "recommended:top_candidate"
+    add_unique(collect_from_recommended(driver), recommended_source)
+    for keyword in keywords:
+        if len(result) >= settings.max_candidates:
+            break
+        search_source = "search:%s" % keyword
+        add_unique(
+            collect_from_search(
+                driver,
+                keyword,
+                location=location,
+                pages=settings.pages_per_keyword,
+                sort_by_date=True,
+            ),
+            search_source,
+        )
+
+    for source, count in breakdown.items():
+        logger.info("Candidate source %s contributed %d unique jobs", source, count)
+    return result
+
+
+__all__ = [
+    "collect_candidates",
+    "collect_from_recommended",
+    "collect_from_search",
+    "job_id_from_url",
+    "parse_posted_days",
+]

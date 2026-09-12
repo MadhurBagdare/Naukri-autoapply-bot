@@ -107,6 +107,79 @@ After running, results are saved to **`naukriapplied.csv`** with two columns:
 - `passed` — URLs of jobs successfully applied to
 - `failed` — URLs where the apply attempt failed
 
+## 🤖 naukri_bot (v2 — recommended)
+
+`Naukri-Edge.py` and `Naukri-Recommended.py` above are the **legacy** scripts. They are kept
+as-is and still work the way they always did. New work happens in the `naukri_bot/` package,
+which exists because the legacy scripts could not answer three questions honestly:
+
+1. *Did the application actually go through?* — a click that did not raise proves nothing.
+2. *How much of my 50/day quota is left?* — "Apply on company site" leaves Naukri entirely
+   and consumes zero quota, yet the legacy counter incremented for it.
+3. *Is this job actually relevant to me?* — the legacy scripts ranked nothing; they took
+   Naukri's own ordering, or whatever the keyword search happened to return.
+
+### What it does
+
+One command, once each morning:
+
+```bash
+python3 -m naukri_bot --dry-run   # show what it WOULD apply to, click nothing
+python3 -m naukri_bot             # actually apply
+```
+
+It collects a large candidate pool from freshness-sorted keyword searches (keywords derived
+from **your** resume) plus the recommended feed, scores every job against your resume and its
+posting age, drops anything already applied to in a previous run, and then applies to the best
+ones until the daily quota is spent.
+
+### The rules it will not break
+
+- **Nothing is reported as applied unless it is verified.** Login, apply, and questionnaire
+  submission each have an explicit verification step.
+- **Quota is debited only for confirmed Naukri-native applications.** An external redirect is
+  recorded as skipped, not as an application.
+- **Screening questions are answered only from facts you supplied.** If a question needs a fact
+  that is not in your profile, the bot abandons that application rather than guessing. There is
+  no fuzzy matching anywhere in the package — the legacy `fuzzy_lookup` could match
+  "5 years" to "15 years" and submit the wrong answer to a real employer.
+- **Ranking is ours, not Naukri's.**
+
+### Setup
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env                          # credentials + tuning
+cp naukri_bot/profile.example.yaml profile.yaml
+```
+
+Then fill in `profile.yaml`. Fields you leave blank are facts the bot **does not know** — it
+will skip a job rather than invent a notice period or a salary expectation for you. The fields
+that matter most are the ones a resume cannot supply: current CTC, expected CTC, notice period,
+relocation willingness.
+
+### LLM backend
+
+Job scoring and screening answers use an LLM. By default it shells out to the `claude` CLI, so
+**no API key is required**. Set `LLM_BACKEND=anthropic` (and `ANTHROPIC_API_KEY`) to use the SDK
+instead, or `LLM_BACKEND=none` to run on lexical scoring alone — in that mode any screening
+question that is not already in the answer cache will cause the bot to skip that job.
+
+### Useful flags
+
+| Flag | Effect |
+|------|--------|
+| `--dry-run` | Rank and print the plan, then stop before the first click |
+| `--limit N` | Apply to at most N jobs this run |
+| `--min-score S` | Raise/lower the relevance floor (default 55) |
+| `--max-days-old D` | Ignore postings older than D days (default 7) |
+| `--keywords "a,b"` | Override resume-derived search keywords |
+| `--answer-mode propose` | Log what it *would* answer, then skip — good for a first run |
+| `--headless` | Run without a visible window (more likely to be challenged) |
+
+`naukri_bot.db` holds your applied-history and quota memory. Deleting it makes the bot forget
+what it already applied to and how much quota it has spent today — back it up, don't clear it.
+
 ## 🔧 2026 Naukri.com Update
 
 The bot has been updated to work with Naukri.com's 2026 redesign. Key changes:
@@ -127,9 +200,29 @@ Naukri-autoapply-bot/
 ├── .gitignore            # Files to exclude from git
 ├── requirements.txt      # Python dependencies
 ├── README.md             # This file
-├── Naukri-Edge.py        # Main bot script for Microsoft Edge browser
+├── profile.example.yaml  # (in naukri_bot/) copy to profile.yaml and fill in your facts
+│
+├── naukri_bot/           # v2 package — the maintained bot (python3 -m naukri_bot)
+│   ├── __main__.py       #   entry point
+│   ├── cli.py            #   argument parsing + pipeline wiring
+│   ├── models.py         #   shared dataclasses; every other module imports from here
+│   ├── config.py         #   .env -> Settings
+│   ├── profile.py        #   profile.yaml + resume -> Profile
+│   ├── browser.py        #   driver factory with anti-detection
+│   ├── auth.py           #   login that VERIFIES it worked
+│   ├── sources.py        #   candidate collection (freshness-sorted search + recommended)
+│   ├── ranking.py        #   resume-based scoring — our order, not Naukri's
+│   ├── llm.py            #   LLM client (claude CLI by default, no API key needed)
+│   ├── answers.py        #   screening answers: exact cache -> profile -> LLM -> abstain
+│   ├── apply.py          #   verified apply; native vs external redirect
+│   ├── chatbot.py        #   questionnaire drawer handling
+│   └── ledger.py         #   SQLite applied-history + rolling 24h quota ledger
+│
+├── naukri_bot.db         # v2 state: applied history + quota memory (auto-generated)
+├── Naukri-Edge.py        # Legacy bot script for Microsoft Edge browser
+├── Naukri-Recommended.py # Legacy bot for the recommended-jobs feed
 ├── Naukri autoapply jobs.ipynb  # Jupyter Notebook version (legacy)
-└── naukriapplied.csv     # Output: applied/failed job links (auto-generated)
+└── naukriapplied.csv     # Legacy output: applied/failed job links (auto-generated)
 ```
 
 ## 🔧 Troubleshooting

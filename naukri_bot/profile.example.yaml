@@ -1,0 +1,95 @@
+# Copy this file to profile.yaml, review every value, and keep it private.
+# These facts are used to answer employer screening questions, so only state facts
+# that Madhur has personally confirmed. YAML null values are intentionally unknown.
+
+# Identity and contact details from Madhur Bagdare's resume.
+full_name: Madhur Bagdare
+first_name: Madhur
+last_name: Bagdare
+email: madhur.bagdare@gmail.com
+phone: "+91 96444 51099"
+
+# Current and preferred work locations.
+current_location: Indore, India
+preferred_locations:
+  - Bengaluru
+  - Hyderabad
+  - Remote
+  - Indore
+
+# Experience shown by the resume (February 2024 to present).
+total_experience_years: 2.5
+highest_qualification: "B.Tech Computer Science Engineering, Medi-Caps University (2024)"
+
+# Target roles supported by Madhur's resume.
+titles:
+  - AI Engineer
+  - AI Research Engineer
+  - Machine Learning Engineer
+  - LLM Engineer
+  - Applied Scientist
+  - Software Engineer - AI
+
+# Skills explicitly represented in Madhur's resume.
+skills:
+  - Python
+  - C++
+  - SQL
+  - LLM evaluation
+  - LLM benchmarking
+  - agentic AI
+  - multi-agent orchestration
+  - prompt engineering
+  - RAG
+  - hybrid retrieval
+  - embeddings
+  - vector search
+  - RLHF
+  - fine-tuning
+  - OpenAI API
+  - Anthropic API
+  - LangChain
+  - LiteLLM
+  - OpenHands
+  - Hugging Face Transformers
+  - PyTorch
+  - FastAPI
+  - pytest
+  - spaCy
+  - Pandas
+  - NumPy
+  - Scikit-learn
+  - PySpark
+  - AWS Bedrock
+  - AWS EC2
+  - AWS S3
+  - Docker
+  - Git
+  - Git LFS
+  - CI/CD
+  - PostgreSQL
+  - FAISS
+  - pgvector
+  - Linux
+
+# Confirmed authorization fact.
+work_authorization: "Indian citizen, no sponsorship required"
+
+# IMPORTANT: null makes the bot SKIP a job asking the corresponding question.
+# The bot will never guess or make a false statement to an employer.
+current_ctc_lpa: null
+# Madhur's resume targets a 22-28 LPA band, but Madhur must state this number himself.
+expected_ctc_lpa: null
+notice_period_days: null
+serving_notice: null
+willing_to_relocate: null
+has_passport: null
+
+# Add personally confirmed facts here. Leave unknown values null or commented out.
+extra_facts:
+  # reason_for_change: "Seeking ..."
+  # current_company: "Company name"
+  # current_designation: "Job title"
+  # date_of_birth: "YYYY-MM-DD"
+  # gender: "Self-described value"
+  # differently_abled: false

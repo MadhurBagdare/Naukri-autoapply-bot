@@ -1,0 +1,367 @@
+"""Fail-closed handling of Naukri's application chatbot drawer."""
+
+# noqa: SIZE_OK - the requested drawer state machine must remain in this module.
+
+import logging
+import time
+from typing import List, Optional, Protocol, Tuple
+
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from .browser import human_pause, human_type
+from .models import AnswerResolution, ChatbotOutcome, Profile, Settings
+
+
+logger = logging.getLogger(__name__)
+
+_DRAWER = "[id*='ChatbotContainer'], .chatbot_Drawer"
+_BOT_MESSAGES = ".chatbot_ListItem.botItem .msg, .chatbot_ListItem .botMsg .msg"
+_USER_MESSAGES = ".chatbot_ListItem.userItem .msg, .userMsg .msg"
+_RADIO_CONTAINER = ".singleselect-radiobutton-container"
+_RADIOS = ".ssrc__radio"
+_RADIO_LABELS = ".ssrc__label"
+_SEND = ".sendMsg, .sendMsgbtn_container .sendMsg, [class*='sendMsg']"
+_TEXT_AREAS = (
+    ".chatbot_SendMessageContainer .textArea[contenteditable='true'], "
+    ".chatbot_InputContainer .textArea[contenteditable='true'], "
+    "div.textArea[contenteditable='true'], [contenteditable='true']"
+)
+_PLAIN_INPUTS = "input:not([type]), input[type='text'], input[type='number'], textarea"
+_CHECKBOXES = "input[type='checkbox'], [role='checkbox']"
+_OVERALL_TIMEOUT = 180.0
+_STALL_TIMEOUT = 30.0
+
+
+class AnswerEngine(Protocol):
+    def resolve(
+        self,
+        question: str,
+        options: Optional[List[str]] = None,
+        field_type: str = "text",
+    ) -> AnswerResolution:
+        ...
+
+
+def _normalise(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _visible(elements: List[WebElement]) -> List[WebElement]:
+    return [element for element in elements if element.is_displayed()]
+
+
+def _latest_question(driver: WebDriver) -> str:
+    messages = _visible(driver.find_elements(By.CSS_SELECTOR, _BOT_MESSAGES))
+    if not messages:
+        return "unidentified chatbot question"
+    return " ".join(messages[-1].text.split()) or "unidentified chatbot question"
+
+
+def is_drawer_open(driver: WebDriver) -> bool:
+    """Return whether a visible chatbot drawer is present."""
+    try:
+        return bool(_visible(driver.find_elements(By.CSS_SELECTOR, _DRAWER)))
+    except (StaleElementReferenceException, WebDriverException) as exc:
+        logger.warning("Could not inspect chatbot drawer (%s): %s", type(exc).__name__, exc)
+        raise
+
+
+def find_chat_text_area(driver: WebDriver) -> Optional[WebElement]:
+    """Find a visible, enabled contenteditable chatbot input."""
+    try:
+        for element in driver.find_elements(By.CSS_SELECTOR, _TEXT_AREAS):
+            if element.is_displayed() and element.is_enabled():
+                return element
+    except (StaleElementReferenceException, WebDriverException) as exc:
+        logger.warning("Could not locate chatbot text area (%s): %s", type(exc).__name__, exc)
+    return None
+
+
+def _read_contenteditable(element: WebElement) -> str:
+    candidates = (
+        element.text,
+        element.get_attribute("innerText") or "",
+        element.get_attribute("textContent") or "",
+    )
+    for candidate in candidates:
+        if candidate.strip():
+            return _normalise(candidate)
+    return ""
+
+
+def write_contenteditable(driver: WebDriver, element: WebElement, text: str) -> bool:
+    """Type with real key events and return true only after DOM verification."""
+    intended = _normalise(text)
+    try:
+        element.click()
+        platform_name = str(driver.capabilities.get("platformName", "")).casefold()
+        modifier = Keys.COMMAND if "mac" in platform_name else Keys.CONTROL
+        element.send_keys(modifier, "a")
+        element.send_keys(Keys.DELETE)
+        human_type(element, text)
+        if _read_contenteditable(element) == intended:
+            return True
+        logger.warning("Real key events did not produce the requested chatbot text; retrying")
+        driver.execute_script(
+            "arguments[0].focus();"
+            "var r=document.createRange();r.selectNodeContents(arguments[0]);"
+            "var s=window.getSelection();s.removeAllRanges();s.addRange(r);"
+            "document.execCommand('insertText',false,arguments[1]);"
+            "arguments[0].dispatchEvent(new InputEvent('input',"
+            "{bubbles:true,inputType:'insertText',data:arguments[1]}));"
+            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+            element,
+            text,
+        )
+        verified = _read_contenteditable(element) == intended
+        if not verified:
+            logger.error("Chatbot contenteditable write could not be verified")
+        return verified
+    except (StaleElementReferenceException, ElementClickInterceptedException, WebDriverException) as exc:
+        logger.error("Could not write chatbot text (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+def _send_control(driver: WebDriver) -> Optional[WebElement]:
+    for element in driver.find_elements(By.CSS_SELECTOR, _SEND):
+        if element.is_displayed():
+            return element
+    return None
+
+
+def click_send(driver: WebDriver) -> bool:
+    """Click only when a non-disabled ancestor carrying a send class exists."""
+    try:
+        control = _send_control(driver)
+        if control is None:
+            return False
+        ancestors = control.find_elements(
+            By.XPATH,
+            "./ancestor::*[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            "'abcdefghijklmnopqrstuvwxyz'),'send')]",
+        )
+        if not ancestors:
+            logger.warning("Refusing to click send: no send-class ancestor was found")
+            return False
+        classes = " ".join(ancestor.get_attribute("class") or "" for ancestor in ancestors)
+        if "disabled" in classes.casefold():
+            return False
+        control.click()
+        return True
+    except (
+        NoSuchElementException,
+        StaleElementReferenceException,
+        ElementClickInterceptedException,
+        WebDriverException,
+    ) as exc:
+        logger.warning("Could not click chatbot send control (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+def handle_radio(driver: WebDriver, answer_engine: AnswerEngine) -> Optional[bool]:
+    """Resolve, select, verify, and send the visible radio question."""
+    containers = _visible(driver.find_elements(By.CSS_SELECTOR, _RADIO_CONTAINER))
+    if not containers:
+        return False
+    container = containers[0]
+    radios = container.find_elements(By.CSS_SELECTOR, _RADIOS)
+    labels = container.find_elements(By.CSS_SELECTOR, _RADIO_LABELS)
+    options = [" ".join(label.text.split()) for label in labels]
+    question = _latest_question(driver)
+    resolution = answer_engine.resolve(question, options=options, field_type="radio")
+    if resolution.abstained or resolution.answer is None:
+        return None
+    wanted = _normalise(resolution.answer.text)
+    for index, radio in enumerate(radios):
+        label_text = options[index] if index < len(options) else ""
+        value = radio.get_attribute("value") or ""
+        if _normalise(label_text) != wanted and _normalise(value) != wanted:
+            continue
+        target = labels[index] if index < len(labels) else radio
+        target.click()
+        if not radio.is_selected():
+            logger.error("Radio option %r did not become selected", resolution.answer.text)
+            return False
+        return click_send(driver)
+    logger.error("Resolved radio answer %r was absent from the rendered options", resolution.answer.text)
+    return None
+
+
+def handle_text(driver: WebDriver, answer_engine: AnswerEngine) -> Optional[bool]:
+    """Resolve, verifiably type, and send a contenteditable question."""
+    text_area = find_chat_text_area(driver)
+    if text_area is None:
+        return False
+    question = _latest_question(driver)
+    resolution = answer_engine.resolve(question, options=None, field_type="text")
+    if resolution.abstained or resolution.answer is None:
+        return None
+    if not write_contenteditable(driver, text_area, resolution.answer.text):
+        return None
+    return click_send(driver)
+
+
+def _option_label(container: WebElement, control: WebElement) -> str:
+    control_id = control.get_attribute("id") or ""
+    if control_id:
+        labels = container.find_elements(By.CSS_SELECTOR, "label[for='%s']" % control_id)
+        if labels:
+            return " ".join(labels[0].text.split())
+    return " ".join((control.get_attribute("value") or control.text).split())
+
+
+def _handle_checkbox(driver: WebDriver, answer_engine: AnswerEngine) -> Optional[bool]:
+    drawers = _visible(driver.find_elements(By.CSS_SELECTOR, _DRAWER))
+    if not drawers:
+        return False
+    controls = _visible(drawers[0].find_elements(By.CSS_SELECTOR, _CHECKBOXES))
+    if not controls:
+        return False
+    options = [_option_label(drawers[0], control) for control in controls]
+    question = _latest_question(driver)
+    resolution = answer_engine.resolve(question, options=options, field_type="checkbox")
+    if resolution.abstained or resolution.answer is None:
+        return None
+    wanted = _normalise(resolution.answer.text)
+    for index, option in enumerate(options):
+        if _normalise(option) != wanted:
+            continue
+        controls[index].click()
+        if not controls[index].is_selected():
+            logger.error("Checkbox option %r did not become selected", option)
+            return False
+        return click_send(driver)
+    return None
+
+
+def _handle_plain_text(driver: WebDriver, answer_engine: AnswerEngine) -> Optional[bool]:
+    drawers = _visible(driver.find_elements(By.CSS_SELECTOR, _DRAWER))
+    if not drawers:
+        return False
+    controls = [
+        element
+        for element in drawers[0].find_elements(By.CSS_SELECTOR, _PLAIN_INPUTS)
+        if element.is_displayed() and element.is_enabled()
+    ]
+    if not controls:
+        return False
+    question = _latest_question(driver)
+    resolution = answer_engine.resolve(question, options=None, field_type="text")
+    if resolution.abstained or resolution.answer is None:
+        return None
+    control = controls[0]
+    control.clear()
+    human_type(control, resolution.answer.text)
+    if _normalise(control.get_attribute("value") or "") != _normalise(resolution.answer.text):
+        logger.error("Plain chatbot input write could not be verified")
+        return None
+    return click_send(driver)
+
+
+def _dom_state(driver: WebDriver) -> Tuple[int, int, int, int, int, str]:
+    bot_messages = driver.find_elements(By.CSS_SELECTOR, _BOT_MESSAGES)
+    user_messages = driver.find_elements(By.CSS_SELECTOR, _USER_MESSAGES)
+    return (
+        len(bot_messages),
+        len(user_messages),
+        len(driver.find_elements(By.CSS_SELECTOR, _RADIOS)),
+        len(driver.find_elements(By.CSS_SELECTOR, _CHECKBOXES)),
+        len(driver.find_elements(By.CSS_SELECTOR, _TEXT_AREAS + ", " + _PLAIN_INPUTS)),
+        _latest_question(driver),
+    )
+
+
+def handle_chatbot(
+    driver: WebDriver,
+    profile: Profile,
+    answer_engine: AnswerEngine,
+    settings: Settings,
+) -> ChatbotOutcome:
+    """Process the drawer within a wall-clock budget and stop on any abstain."""
+    del profile, settings
+    try:
+        WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.CSS_SELECTOR, _DRAWER)))
+    except TimeoutException as exc:
+        logger.warning("Chatbot drawer did not appear: %s", exc)
+        return ChatbotOutcome(False, 0, 0, "drawer_not_found")
+    except WebDriverException as exc:
+        logger.error("Could not inspect chatbot drawer (%s): %s", type(exc).__name__, exc)
+        return ChatbotOutcome(False, 0, 0, "%s: %s" % (type(exc).__name__, exc))
+
+    answered = 0
+    deadline = time.monotonic() + _OVERALL_TIMEOUT
+    try:
+        state = _dom_state(driver)
+    except (StaleElementReferenceException, WebDriverException) as exc:
+        logger.error("Could not read initial chatbot state (%s): %s", type(exc).__name__, exc)
+        return ChatbotOutcome(False, 0, 0, "%s: %s" % (type(exc).__name__, exc))
+    changed_at = time.monotonic()
+    acted_state: Optional[Tuple[int, int, int, int, int, str]] = None
+    while time.monotonic() < deadline:
+        try:
+            if not is_drawer_open(driver):
+                return ChatbotOutcome(True, answered, 0, "drawer_closed")
+            current_state = _dom_state(driver)
+            if current_state != state:
+                state = current_state
+                changed_at = time.monotonic()
+                acted_state = None
+
+            handled: Optional[bool] = False
+            if acted_state != current_state:
+                handled = handle_radio(driver, answer_engine)
+                if handled is False:
+                    handled = _handle_checkbox(driver, answer_engine)
+                if handled is False:
+                    handled = handle_text(driver, answer_engine)
+                if handled is False:
+                    handled = _handle_plain_text(driver, answer_engine)
+            if handled is None:
+                question = _latest_question(driver)
+                logger.info("Abandoning application at unanswered question: %s", question)
+                return ChatbotOutcome(False, answered, 1, question)
+            if handled:
+                answered += 1
+                acted_state = current_state
+                human_pause(0.45, 1.1)
+                continue
+            if acted_state != current_state and click_send(driver):
+                acted_state = current_state
+                human_pause(0.45, 1.1)
+                continue
+
+            no_input = current_state[2] == 0 and current_state[3] == 0 and current_state[4] == 0
+            if no_input and time.monotonic() - changed_at >= _STALL_TIMEOUT:
+                return ChatbotOutcome(False, answered, 0, "stalled")
+            human_pause(0.3, 0.75)
+        except (NoSuchElementException, StaleElementReferenceException) as exc:
+            logger.debug("Chatbot DOM changed during dispatch (%s): %s", type(exc).__name__, exc)
+            human_pause(0.2, 0.5)
+        except (ElementClickInterceptedException, WebDriverException) as exc:
+            logger.error("Chatbot dispatch failed (%s): %s", type(exc).__name__, exc)
+            return ChatbotOutcome(False, answered, 0, "%s: %s" % (type(exc).__name__, exc))
+    return ChatbotOutcome(False, answered, 0, "timeout")
+
+
+__all__ = [
+    "AnswerEngine",
+    "click_send",
+    "find_chat_text_area",
+    "handle_chatbot",
+    "handle_radio",
+    "handle_text",
+    "is_drawer_open",
+    "write_contenteditable",
+]

@@ -34,3 +34,11 @@ env/
 .venv/
 
 application_answers.csv
+
+# Personal facts + local application history (naukri_bot v2)
+# profile.yaml holds salary, phone, optionally DOB — never commit it.
+# naukri_bot.db holds your applied-job history and cached screening answers.
+profile.yaml
+naukri_bot.db
+naukri_bot.db-wal
+naukri_bot.db-shm
