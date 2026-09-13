@@ -50,6 +50,7 @@ VIEW_ALL_SELECTOR = "a[href='%s']" % EARLY_ACCESS_PATH
 CARD_SELECTOR = "div.cust-job-tuple"
 SHARE_BUTTON_SELECTOR = "button.unshared"
 SAVE_APPLY_PATH = "/myapply/saveApply"
+LISTING_URL = "https://www.naukri.com" + EARLY_ACCESS_PATH
 
 # Deliberately slower than the browsing default: this path clicks many buttons
 # in sequence, which is the pattern that looks least like a person.
@@ -108,31 +109,81 @@ def _attr_or_text(card: Any, selector: str) -> str:
     return element.get_text(" ", strip=True)
 
 
-def open_page(driver: Any, settings: Settings) -> bool:
-    """Reach the early access listing through the homepage link.
-
-    Direct navigation to the listing URL bounces back to the homepage, so the
-    in-app link has to be clicked.  Returns False rather than raising when the
-    page cannot be reached.
-    """
-    if not safe_get(driver, HOMEPAGE_URL):
-        logger.warning("Could not load the Naukri homepage; early access skipped.")
+def _land_on_listing(driver: Any, url: str, wait_s: int = 15) -> bool:
+    """Load ``url`` and report whether we ended up on a rendered listing."""
+    if not safe_get(driver, url):
         return False
     try:
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, VIEW_ALL_SELECTOR))
+        current = driver.current_url
+    except WebDriverException as exc:
+        logger.debug("Could not read the current URL after loading %s: %s", url, exc)
+        return False
+    if EARLY_ACCESS_PATH not in current:
+        logger.debug("%s redirected to %s", url, current)
+        return False
+    try:
+        WebDriverWait(driver, wait_s).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, CARD_SELECTOR))
         )
-        link = driver.find_element(By.CSS_SELECTOR, VIEW_ALL_SELECTOR)
+    except TimeoutException:
+        logger.debug("%s rendered no cards within %ds", current, wait_s)
+        return False
+    return True
+
+
+def open_page(driver: Any, settings: Settings, attempts: int = 3) -> bool:
+    """Reach the early access listing.
+
+    Direct navigation works once the session is warm (6 of 6 when probed) but
+    bounced back to the homepage on a cold session right after login, so the
+    homepage link stays as a fallback.  That fallback is unreliable on its own:
+    Naukri serves the early access strip on only about a third of homepage
+    renders, and on a miss the entire widget is absent from the HTML rather
+    than lazy-loaded, so reloading is the only recourse.
+
+    Returns False rather than raising when the page cannot be reached.
+    """
+    if _land_on_listing(driver, LISTING_URL, wait_s=15):
+        human_pause()
+        return True
+
+    link = None
+    total = max(1, attempts)
+    for attempt in range(1, total + 1):
+        if not safe_get(driver, HOMEPAGE_URL):
+            logger.warning("Could not load the Naukri homepage; early access skipped.")
+            return False
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, VIEW_ALL_SELECTOR))
+            )
+            link = driver.find_element(By.CSS_SELECTOR, VIEW_ALL_SELECTOR)
+            break
+        except TimeoutException:
+            logger.info(
+                "Homepage render %d of %d did not include the early access strip.",
+                attempt,
+                total,
+            )
+            human_pause()
+
+    if link is None:
+        logger.warning(
+            "No early access link after %d homepage loads - either there are no "
+            "early access roles right now, or the homepage layout changed.",
+            total,
+        )
+        return False
+
+    try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'})", link)
         human_pause()
         link.click()
-    except TimeoutException:
-        logger.warning(
-            "No early access link on the homepage within 20s - either there are "
-            "no early access roles right now, or the homepage layout changed."
-        )
-        return False
-    except (ElementClickInterceptedException, WebDriverException) as exc:
+    except (
+        ElementClickInterceptedException,
+        StaleElementReferenceException,
+        WebDriverException,
+    ) as exc:
         logger.warning("Could not open the early access listing: %s", exc)
         return False
 
