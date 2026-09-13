@@ -253,6 +253,7 @@ def _report_plan(selected: List[ScoredJob], ranking_module: Any) -> None:
             scored.job.posted_label or "age unknown",
         )
         logger.info("      %s", ranking_module.explain(scored))
+        logger.info("      via %s", scored.job.source or "unknown source")
         logger.info("      %s", scored.job.url)
 
 

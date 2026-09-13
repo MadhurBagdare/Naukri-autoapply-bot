@@ -90,9 +90,9 @@ def _text(card: Any, selectors: Tuple[str, ...], field: str) -> str:
         return ""
 
 
-def _tags(card: Any) -> List[str]:
+def _tags(card: Any, selector: str = "ul.tags-gt li") -> List[str]:
     try:
-        elements = card.select("ul.tags-gt li")
+        elements = card.select(selector)
     except AttributeError as exc:
         logger.debug("Could not parse tags: %s", exc)
         return []
@@ -167,6 +167,72 @@ def _parse_cards(cards: List[Any], source: str) -> List[JobPosting]:
             len(cards),
             missing_title,
             missing_href,
+        )
+    return jobs
+
+
+def _parse_recommended_cards(cards: List[Any], source: str) -> List[JobPosting]:
+    """Parse the legacy ``article.jobTuple`` cards used by the recommended feed.
+
+    These cards carry no anchor at all: the title is a ``<p>`` and the only
+    href points off-site to AmbitionBox.  The job id lives on the article as
+    ``data-job-id``, and ``/job-listings-<id>`` resolves without the usual
+    slug, so the URL is constructed rather than read.
+    """
+    jobs: List[JobPosting] = []
+    missing_id = 0
+    missing_title = 0
+    for index, card in enumerate(cards, 1):
+        job_id = ""
+        try:
+            job_id = (card.get("data-job-id", "") or "").strip()
+        except AttributeError as exc:
+            logger.debug("Could not read data-job-id on card %d: %s", index, exc)
+        if not job_id:
+            missing_id += 1
+            continue
+
+        title = _text(card, ("p.title", "[class*='title']"), "title")
+        if not title:
+            missing_title += 1
+            continue
+
+        posted_label = _text(
+            card,
+            (
+                "div.jobTupleFooter span.fw500",
+                "div.type.plcHolder span",
+                "[class*='plcHolder'] span",
+            ),
+            "posted label",
+        )
+        jobs.append(
+            JobPosting(
+                job_id=job_id,
+                url="https://www.naukri.com/job-listings-%s" % job_id,
+                title=title,
+                company=_text(card, ("span.subTitle", "[class*='subTitle']"), "company"),
+                experience=_text(card, ("li.experience span",), "experience"),
+                salary=_text(card, ("li.salary span",), "salary"),
+                location=_text(card, ("li.location span",), "location"),
+                description=_text(
+                    card, ("div.job-description span", "div.job-description"), "description"
+                ),
+                tags=_tags(card, "ul.tags li"),
+                posted_label=posted_label,
+                posted_days_ago=parse_posted_days(posted_label),
+                source=source,
+            )
+        )
+    if missing_id or missing_title:
+        logger.warning(
+            "%s: dropped %d of %d cards (%d without a job id, %d without a "
+            "title). If this is every card, Naukri's card markup has changed.",
+            source,
+            missing_id + missing_title,
+            len(cards),
+            missing_id,
+            missing_title,
         )
     return jobs
 
@@ -267,22 +333,65 @@ def _active_tab_id(driver) -> str:
         return "default (unidentified)"
 
 
+RECOMMENDED_PATH = "/mnjuser/recommendedjobs"
+RECOMMENDED_URL = "https://www.naukri.com" + RECOMMENDED_PATH
+RECOMMENDED_HOMEPAGE = "https://www.naukri.com/mnjuser/homepage"
+RECOMMENDED_TABS = ("profile", "top_candidate", "apply", "preference", "similar_jobs")
+
+
+def _current_url(driver) -> str:
+    try:
+        return driver.current_url or ""
+    except WebDriverException as exc:
+        logger.debug("Could not read the current URL: %s", exc)
+        return ""
+
+
+def _reach_recommended(driver, attempts: int = 2) -> bool:
+    """Land on the recommended-jobs listing, warming the session first.
+
+    Navigating straight there immediately after login bounces to the homepage,
+    where the dashboard strip shows Early Access cards that carry no job link.
+    Loading the homepage first and then navigating avoids that.
+    """
+    total = max(1, attempts)
+    for attempt in range(1, total + 1):
+        if not safe_get(driver, RECOMMENDED_HOMEPAGE):
+            logger.warning("Could not load the Naukri homepage; recommended jobs skipped.")
+            return False
+        human_pause()
+        if not safe_get(driver, RECOMMENDED_URL):
+            logger.warning("Could not navigate to recommended jobs at %s", RECOMMENDED_URL)
+            return False
+        if RECOMMENDED_PATH in _current_url(driver):
+            try:
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".tab-list"))
+                )
+            except TimeoutException:
+                logger.warning("Recommended jobs loaded but showed no tab list within 20s.")
+                return False
+            return True
+        logger.info(
+            "Recommended jobs bounced to %s on attempt %d of %d.",
+            _current_url(driver),
+            attempt,
+            total,
+        )
+        human_pause()
+    logger.warning("Recommended jobs kept redirecting away; skipping that source.")
+    return False
+
+
 def collect_from_recommended(
     driver, tab_id: str = "top_candidate", max_pages: int = 3
 ) -> List[JobPosting]:
-    """Collect cards from a recommended-jobs tab, including lazy-loaded cards."""
-    url = "https://www.naukri.com/mnjuser/recommendedjobs"
-    try:
-        if not safe_get(driver, url):
-            logger.warning("Could not navigate to recommended jobs at %s", url)
-            return []
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".tab-list"))
-        )
-    except TimeoutException as exc:
-        logger.warning("Recommended tab list did not load at %s: %s", url, exc)
-    except WebDriverException as exc:
-        logger.warning("WebDriver failed loading recommended jobs at %s: %s", url, exc)
+    """Collect cards from a recommended-jobs tab, including lazy-loaded cards.
+
+    Staying on the listing between tabs matters: re-navigating for each tab
+    would pay the homepage warm-up five times over.
+    """
+    if RECOMMENDED_PATH not in _current_url(driver) and not _reach_recommended(driver):
         return []
 
     requested_selector = "div#%s .tab-list-item" % tab_id
@@ -329,15 +438,14 @@ def collect_from_recommended(
     except AttributeError as exc:
         logger.warning("Could not parse recommended cards: %s", exc)
 
-    parsed = _parse_cards(latest_cards, "recommended:%s" % tab_id)
+    parsed = _parse_recommended_cards(latest_cards, "recommended:%s" % tab_id)
     if latest_cards and not parsed:
         logger.warning(
-            "Recommended feed yielded %d cards but no usable postings. Naukri's "
-            "recommended cards carry no job link: the title is an <a> without an "
-            "href, the company is a <span>, and the page contains no job id we "
-            "can turn into a URL - the feed navigates through a JavaScript click "
-            "handler instead. Keyword search is the working source; recommended "
-            "jobs are skipped.",
+            "Recommended tab %s yielded %d cards but no usable postings. The "
+            "cards should carry a data-job-id; if none do, either we landed on "
+            "the homepage dashboard strip instead of the listing, or Naukri's "
+            "card markup has changed.",
+            tab_id,
             len(latest_cards),
         )
     return parsed
@@ -362,8 +470,13 @@ def collect_candidates(
             result.append(job)
             breakdown[job.source] = breakdown.get(job.source, 0) + 1
 
-    recommended_source = "recommended:top_candidate"
-    add_unique(collect_from_recommended(driver), recommended_source)
+    for tab_id in RECOMMENDED_TABS:
+        if len(result) >= settings.max_candidates:
+            break
+        add_unique(
+            collect_from_recommended(driver, tab_id=tab_id),
+            "recommended:%s" % tab_id,
+        )
     for keyword in keywords:
         if len(result) >= settings.max_candidates:
             break
