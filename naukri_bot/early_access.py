@@ -22,8 +22,10 @@ when the homepage "View all" link is clicked, which is what ``open_page`` does.
 import hashlib
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import (
@@ -47,6 +49,7 @@ EARLY_ACCESS_PATH = "/mnjuser/recommended-earjobs"
 VIEW_ALL_SELECTOR = "a[href='%s']" % EARLY_ACCESS_PATH
 CARD_SELECTOR = "div.cust-job-tuple"
 SHARE_BUTTON_SELECTOR = "button.unshared"
+SAVE_APPLY_PATH = "/myapply/saveApply"
 
 # Deliberately slower than the browsing default: this path clicks many buttons
 # in sequence, which is the pattern that looks least like a person.
@@ -201,21 +204,67 @@ def _share_button(driver: Any, index: int) -> Optional[Any]:
     return buttons[0]
 
 
-def _verify_shared(driver: Any, index: int, timeout: int = 10) -> Tuple[bool, str]:
-    """Confirm the button on card ``index`` left the unshared state.
+def _classify_redirect(url: str) -> Tuple[bool, str]:
+    """Decide whether leaving the listing was a successful share or a fault.
 
-    A click that did not raise proves nothing - the class flip is the only
-    signal Naukri gives us, so it is the only thing counted as success.
+    Sharing interest bounces the browser to Naukri's S2J confirmation URL, so
+    leaving the listing is the success path here rather than an anomaly.  Any
+    other destination is still treated as a fault.
     """
-    try:
-        WebDriverWait(driver, timeout).until(
-            lambda d: _share_button(d, index) is None
-        )
-    except TimeoutException:
-        return False, "button still reads 'Share interest'"
-    except (StaleElementReferenceException, WebDriverException) as exc:
-        return False, "could not re-read the button: %s" % exc
-    return True, "interest shared"
+    if SAVE_APPLY_PATH not in url:
+        return False, "navigated to %s" % url
+
+    params = parse_qs(urlparse(url).query)
+    sources = params.get("src", []) + params.get("acpPageType", [])
+    if not any("S2J" in value for value in sources):
+        return False, "navigated to a non-S2J %s" % url
+
+    job_id = params.get("strJobsarr", [""])[0].strip("[] ")
+    responses = params.get("multiApplyResp", [""])[0]
+    if job_id and responses:
+        if ('"%s":200' % job_id) not in responses.replace(" ", ""):
+            return False, "Naukri returned %s for job %s" % (responses, job_id)
+
+    title = params.get("jobTitle", [""])[0]
+    return True, "Naukri confirmed job %s (%s)" % (job_id or "?", title or "untitled")
+
+
+def _share_outcome(
+    driver: Any, index: int, listing_url: str, timeout: int = 15
+) -> Tuple[bool, str, str]:
+    """Confirm a share landed, returning ``(ok, kind, detail)``.
+
+    ``kind`` is "flipped" when the button left the unshared state in place, or
+    "navigated" when Naukri redirected to its S2J confirmation URL.  A click
+    that did not raise proves nothing, so one of those two signals is required.
+    """
+    deadline = time.monotonic() + timeout
+    last_url = listing_url
+    while time.monotonic() < deadline:
+        try:
+            last_url = driver.current_url
+        except WebDriverException as exc:
+            return False, "", "could not read the current URL: %s" % exc
+
+        if last_url != listing_url:
+            ok, detail = _classify_redirect(last_url)
+            if ok:
+                return True, "navigated", detail
+            return False, "", detail
+
+        try:
+            if _share_button(driver, index) is None:
+                return True, "flipped", "button left the unshared state"
+        except (StaleElementReferenceException, WebDriverException) as exc:
+            return False, "", "could not re-read the button: %s" % exc
+
+        time.sleep(0.4)
+
+    return (
+        False,
+        "",
+        "button still reads 'Share interest' (last url %s)" % last_url,
+    )
 
 
 def share_all(
@@ -228,8 +277,8 @@ def share_all(
     """Share interest in up to ``limit`` early access roles.
 
     Stops at the first anomaly rather than pressing on: if a button does not
-    flip, or the page navigates away mid-batch, something is wrong and the
-    remaining clicks would be guesses.
+    flip, or the page lands somewhere other than Naukri's S2J confirmation,
+    something is wrong and the remaining clicks would be guesses.
     """
     summary = EarlyAccessSummary()
     if not open_page(driver, settings):
@@ -242,24 +291,46 @@ def share_all(
     if not roles:
         return summary
 
-    listing_url = driver.current_url
-    for role in roles:
-        if summary.shared >= limit:
-            summary.skipped += 1
-            continue
-        try:
-            if ledger.has_shared_interest(role.role_key):
-                summary.already_shared += 1
-                continue
-        except sqlite3.Error:
-            logger.exception("Ledger lookup failed for %s", role.describe())
-            summary.aborted_reason = "ledger lookup failed"
-            break
-
-        if dry_run:
+    if dry_run:
+        for role in roles:
+            try:
+                if ledger.has_shared_interest(role.role_key):
+                    summary.already_shared += 1
+                    continue
+            except sqlite3.Error:
+                logger.exception("Ledger lookup failed for %s", role.describe())
+                summary.aborted_reason = "ledger lookup failed"
+                return summary
             logger.info("[DRY RUN] Would share interest: %s", role.describe())
             summary.skipped += 1
-            continue
+        return summary
+
+    # A successful share navigates away and the listing reshuffles, so card
+    # indices go stale. role_key is a hash of the card's text and survives that.
+    handled = set()  # type: Set[str]
+    while summary.shared < limit:
+        listing_url = driver.current_url
+
+        role = None  # type: Optional[EarlyAccessRole]
+        ledger_failed = False
+        for candidate in roles:
+            if candidate.role_key in handled:
+                continue
+            try:
+                if ledger.has_shared_interest(candidate.role_key):
+                    summary.already_shared += 1
+                    handled.add(candidate.role_key)
+                    continue
+            except sqlite3.Error:
+                logger.exception("Ledger lookup failed for %s", candidate.describe())
+                summary.aborted_reason = "ledger lookup failed"
+                ledger_failed = True
+                break
+            role = candidate
+            break
+        if ledger_failed or role is None:
+            break
+        handled.add(role.role_key)
 
         button = _share_button(driver, role.index)
         if button is None:
@@ -289,32 +360,39 @@ def share_all(
             summary.aborted_reason = "click failed"
             break
 
-        verified, detail = _verify_shared(driver, role.index)
-        if not verified:
+        ok, kind, detail = _share_outcome(driver, role.index, listing_url)
+        if not ok:
             logger.warning("Not counting %s: %s", role.describe(), detail)
             summary.failed += 1
             summary.aborted_reason = "share was not confirmed: %s" % detail
             break
 
-        if driver.current_url != listing_url:
-            logger.warning(
-                "Page navigated to %s mid-batch; stopping.", driver.current_url
+        try:
+            ledger.record_interest_share(
+                role.role_key,
+                title=role.title,
+                company=role.company,
+                experience=role.experience,
+                location=role.location,
+                posted_label=role.posted_label,
             )
-            summary.aborted_reason = "unexpected navigation"
+        except sqlite3.Error:
+            logger.exception("Could not record the share for %s", role.describe())
+            summary.aborted_reason = "could not record the share"
             break
 
-        ledger.record_interest_share(
-            role.role_key,
-            title=role.title,
-            company=role.company,
-            experience=role.experience,
-            location=role.location,
-            posted_label=role.posted_label,
-        )
         summary.shared += 1
-        logger.info("Shared interest: %s", role.describe())
+        logger.info("Shared interest: %s (%s)", role.describe(), detail)
+
+        if kind == "navigated":
+            if not open_page(driver, settings):
+                summary.aborted_reason = "could not return to the early access listing"
+                break
+            roles = collect_roles(driver)
+
         human_pause(*SHARE_PAUSE)
 
+    summary.skipped += sum(1 for role in roles if role.role_key not in handled)
     return summary
 
 
