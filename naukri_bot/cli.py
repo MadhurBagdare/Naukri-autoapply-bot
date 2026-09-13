@@ -128,6 +128,33 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to the .env file (default: .env beside the package).",
     )
     parser.add_argument(
+        "--early-access",
+        action="store_true",
+        help=(
+            "Share interest on Naukri's Early Access roles before applying. "
+            "These are saved recruiter searches, not postings, so this costs "
+            "none of the 50/day apply quota."
+        ),
+    )
+    parser.add_argument(
+        "--early-access-limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help=(
+            "Maximum Early Access roles to share interest on per run "
+            "(default: 20; the listing typically holds ~70)."
+        ),
+    )
+    parser.add_argument(
+        "--early-access-only",
+        action="store_true",
+        help=(
+            "Share Early Access interest and stop. No job search, no "
+            "applications, no apply quota spent."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -273,13 +300,20 @@ def _tally(summary: RunSummary, result: ApplyResult) -> None:
         summary.errors += 1
 
 
-def run(settings: Settings, profile: Profile) -> RunSummary:
+def run(
+    settings: Settings,
+    profile: Profile,
+    early_access: bool = False,
+    early_access_limit: int = 20,
+    early_access_only: bool = False,
+) -> RunSummary:
     """Execute one full morning run. Imports are local so that --help and
     configuration errors do not require Selenium to be installed."""
     from . import apply as apply_module
     from . import answers as answers_module
     from . import auth
     from . import browser
+    from . import early_access as early_access_module
     from . import ledger as ledger_module
     from . import llm
     from . import ranking
@@ -324,6 +358,32 @@ def run(settings: Settings, profile: Profile) -> RunSummary:
                 raise _NeedsHuman(login_result.reason)
             raise RuntimeError("login failed: %s" % login_result.reason)
         logger.info("Login verified.")
+
+        if early_access:
+            ea_summary = early_access_module.share_all(
+                driver,
+                settings,
+                ledger,
+                limit=early_access_limit,
+                dry_run=settings.dry_run,
+            )
+            logger.info(
+                "Early access: %d roles listed, %d shared, %d already shared, "
+                "%d failed, %d skipped. No apply quota was used.",
+                ea_summary.found,
+                ea_summary.shared,
+                ea_summary.already_shared,
+                ea_summary.failed,
+                ea_summary.skipped,
+            )
+            if ea_summary.aborted_reason:
+                logger.warning(
+                    "Early access pass stopped early: %s",
+                    ea_summary.aborted_reason,
+                )
+            if early_access_only:
+                summary.quota_after = summary.quota_before
+                return summary
 
         keywords = derive_keywords(profile, settings)
         logger.info("Searching with keywords: %s", ", ".join(keywords) or "(none)")
@@ -451,7 +511,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     try:
-        summary = run(settings, profile)
+        summary = run(
+            settings,
+            profile,
+            early_access=args.early_access or args.early_access_only,
+            early_access_limit=args.early_access_limit,
+            early_access_only=args.early_access_only,
+        )
     except _NeedsHuman as exc:
         logger.error("Login needs a human: %s", exc)
         logger.error(

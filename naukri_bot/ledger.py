@@ -88,6 +88,11 @@ class Ledger:
                         finished_at TEXT, collected INTEGER, ranked INTEGER,
                         attempted INTEGER, applied INTEGER, summary_json TEXT
                     );
+                    CREATE TABLE IF NOT EXISTS early_access_shares(
+                        role_key TEXT PRIMARY KEY, title TEXT, company TEXT,
+                        experience TEXT, location TEXT, posted_label TEXT,
+                        shared_at TEXT
+                    );
                     """
                 )
         except sqlite3.Error:
@@ -127,6 +132,45 @@ class Ledger:
             return row is not None
         except sqlite3.Error:
             logger.exception("failed to check seen status for job %s", job_id)
+            raise
+
+    def has_shared_interest(self, role_key: str) -> bool:
+        try:
+            with self._lock:
+                row = self._connection.execute(
+                    "SELECT 1 FROM early_access_shares WHERE role_key = ? LIMIT 1",
+                    (role_key,),
+                ).fetchone()
+        except sqlite3.Error:
+            logger.exception("failed to read early access share %s", role_key)
+            raise
+        return row is not None
+
+    def record_interest_share(
+        self,
+        role_key: str,
+        title: str = "",
+        company: str = "",
+        experience: str = "",
+        location: str = "",
+        posted_label: str = "",
+    ) -> None:
+        now = _now()
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO early_access_shares(
+                        role_key, title, company, experience, location,
+                        posted_label, shared_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(role_key) DO UPDATE SET
+                        shared_at = excluded.shared_at
+                    """,
+                    (role_key, title, company, experience, location, posted_label, now),
+                )
+        except sqlite3.Error:
+            logger.exception("failed to record early access share %s", role_key)
             raise
 
     def record_seen(self, job: JobPosting, score: Optional[float] = None) -> None:
