@@ -14,6 +14,7 @@ from selenium.common.exceptions import (
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait
 
 from .browser import human_pause, safe_get
 from .chatbot import AnswerEngine, handle_chatbot
@@ -46,6 +47,58 @@ _QUOTA_XPATH = (
     " or contains(translate(normalize-space(.),"
     "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'quota has been expired')]"
 )
+_APPLY_CONTROL_CSS = (
+    "button#company-site-button, a#company-site-button, "
+    "button[class*='company-site'], a[class*='company-site'], "
+    "[class*='apply-button-container'] button, "
+    "button#apply-button, a#apply-button, "
+    "button[class*='apply-button'], a[class*='apply-button']"
+)
+_CONTROL_RENDER_TIMEOUT = 15.0
+
+
+def _safe_url(driver: WebDriver) -> str:
+    try:
+        return driver.current_url or ""
+    except WebDriverException as exc:
+        logger.debug("Could not read the current URL: %s", exc)
+        return ""
+
+
+def _on_job_page(driver: WebDriver) -> bool:
+    return "job-listings" in _safe_url(driver)
+
+
+def _apply_controls_present(driver: WebDriver) -> bool:
+    """Report whether any apply control or applied marker is in the DOM yet."""
+    if driver.find_elements(By.CSS_SELECTOR, _APPLY_CONTROL_CSS):
+        return True
+    if driver.find_elements(By.XPATH, _EXTERNAL_TEXT_XPATH):
+        return True
+    if driver.find_elements(By.XPATH, _APPLY_TEXT_XPATH):
+        return True
+    return bool(_applied_marker(driver))
+
+
+def _wait_for_apply_controls(
+    driver: WebDriver, timeout: float = _CONTROL_RENDER_TIMEOUT
+) -> bool:
+    """Wait for the apply control to render before classifying it.
+
+    ``safe_get`` returns as soon as the shell document is ready, but Naukri
+    paints the apply button client-side.  Classifying immediately finds an
+    empty DOM, which is indistinguishable from a page that genuinely has no
+    apply control - the failure mode that made a whole run report
+    ``no_apply_button`` for every job.
+    """
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: _apply_controls_present(d))
+        return True
+    except TimeoutException:
+        return False
+    except WebDriverException as exc:
+        logger.warning("Could not wait for the apply control: %s", exc)
+        return False
 
 
 def _normalise(value: str) -> str:
@@ -79,8 +132,21 @@ def classify_apply_button(driver: WebDriver) -> Tuple[Optional[WebElement], str]
     if external is not None:
         return external, "external"
 
+    # Naukri renders Save and Apply as siblings inside the apply container, with
+    # Save first. Matching the container generically picks Save and silently
+    # un-saves the job instead of applying, so the real id is tried first and the
+    # container fallback refuses anything that looks like a save control.
+    native_by_id = _find_visible(
+        driver, By.CSS_SELECTOR, "button#apply-button, a#apply-button"
+    )
+    if native_by_id is not None:
+        return native_by_id, "native"
+
     wrapper_button = _find_visible(
-        driver, By.CSS_SELECTOR, "[class*='apply-button-container'] button"
+        driver,
+        By.CSS_SELECTOR,
+        "[class*='apply-button-container'] button:not([class*='save'])"
+        ":not([class*='Save'])",
     )
     if wrapper_button is not None:
         return wrapper_button, "native"
@@ -172,6 +238,18 @@ def _result(
     )
 
 
+def _reload_and_check_applied(driver: WebDriver, job: JobPosting) -> str:
+    # Naukri never flips the apply container in place. Both confirmed
+    # applications showed nothing for the full verification window, then
+    # rendered span#already-applied on a fresh load of the same job page.
+    if not safe_get(driver, job.url):
+        return ""
+    if not _on_job_page(driver):
+        safe_get(driver, job.url)
+    _wait_for_apply_controls(driver)
+    return _applied_marker(driver)
+
+
 def apply_to_job(
     driver: WebDriver,
     job: JobPosting,
@@ -188,11 +266,27 @@ def apply_to_job(
         if not safe_get(driver, job.url):
             return _result(job, ApplyStatus.ERROR, "navigation_failed")
 
+        # The first navigation of a fresh session bounces to the dashboard even
+        # though the job URL is valid; the same load succeeds on a second try.
+        if not _on_job_page(driver):
+            logger.info("Job page bounced to %s; retrying once", _safe_url(driver))
+            human_pause()
+            if not safe_get(driver, job.url):
+                return _result(job, ApplyStatus.ERROR, "navigation_failed")
+
+        rendered = _wait_for_apply_controls(driver)
+
         button, classification = classify_apply_button(driver)
         if button is None:
             marker = _applied_marker(driver)
             if marker:
                 return _result(job, ApplyStatus.ALREADY_APPLIED, marker)
+            if not rendered:
+                return _result(
+                    job,
+                    ApplyStatus.NO_APPLY_BUTTON,
+                    "no apply control rendered within %ds" % int(_CONTROL_RENDER_TIMEOUT),
+                )
             return _result(job, ApplyStatus.NO_APPLY_BUTTON, "no actionable apply control")
         if classification == "external":
             text = _element_text(button) or "Apply on company site"
@@ -250,6 +344,11 @@ def apply_to_job(
                         outcome.abstained,
                     )
                 verified, detail = verify_applied(driver)
+                if not verified:
+                    marker = _reload_and_check_applied(driver, job)
+                    if marker:
+                        verified = True
+                        detail = "applied state confirmed on reload: %s" % marker
                 status = ApplyStatus.APPLIED if verified else ApplyStatus.ERROR
                 return _result(
                     job,
@@ -267,7 +366,30 @@ def apply_to_job(
                 return _result(job, ApplyStatus.ERROR, detail)
             human_pause(0.25, 0.6)
 
-        return _result(job, ApplyStatus.ERROR, "application outcome was not verified")
+        marker = _reload_and_check_applied(driver, job)
+        if marker:
+            return _result(
+                job,
+                ApplyStatus.APPLIED,
+                "applied state confirmed on reload: %s" % marker,
+                True,
+            )
+
+        controls: List[str] = []
+        try:
+            controls = [
+                _normalise(_element_text(element))
+                for element in driver.find_elements(By.CSS_SELECTOR, _APPLY_CONTROL_CSS)
+                if element.is_displayed()
+            ]
+        except WebDriverException as exc:
+            logger.debug("Could not inventory apply controls: %s", exc)
+        return _result(
+            job,
+            ApplyStatus.ERROR,
+            "application outcome was not verified (url=%s, controls=%s)"
+            % (_safe_url(driver) or "unknown", controls or "none"),
+        )
     except (
         TimeoutException,
         NoSuchElementException,

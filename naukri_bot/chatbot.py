@@ -42,6 +42,7 @@ _PLAIN_INPUTS = "input:not([type]), input[type='text'], input[type='number'], te
 _CHECKBOXES = "input[type='checkbox'], [role='checkbox']"
 _OVERALL_TIMEOUT = 180.0
 _STALL_TIMEOUT = 30.0
+_QUESTION_WAIT = 8.0
 
 
 class AnswerEngine(Protocol):
@@ -62,11 +63,24 @@ def _visible(elements: List[WebElement]) -> List[WebElement]:
     return [element for element in elements if element.is_displayed()]
 
 
-def _latest_question(driver: WebDriver) -> str:
-    messages = _visible(driver.find_elements(By.CSS_SELECTOR, _BOT_MESSAGES))
-    if not messages:
-        return "unidentified chatbot question"
-    return " ".join(messages[-1].text.split()) or "unidentified chatbot question"
+def _latest_question(driver: WebDriver, wait_s: float = 0.0) -> str:
+    """Read the newest bot message, optionally waiting for it to paint.
+
+    The drawer becomes visible before Naukri renders the question inside it.
+    Reading immediately returns the placeholder, which the answer engine then
+    dutifully abstains on - the question it was handed genuinely was not
+    answerable. Handlers therefore wait; the state sampler does not.
+    """
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while True:
+        messages = _visible(driver.find_elements(By.CSS_SELECTOR, _BOT_MESSAGES))
+        if messages:
+            text = " ".join(messages[-1].text.split())
+            if text:
+                return text
+        if time.monotonic() >= deadline:
+            return "unidentified chatbot question"
+        time.sleep(0.25)
 
 
 def is_drawer_open(driver: WebDriver) -> bool:
@@ -142,21 +156,29 @@ def _send_control(driver: WebDriver) -> Optional[WebElement]:
 
 
 def click_send(driver: WebDriver) -> bool:
-    """Click only when a non-disabled ancestor carrying a send class exists."""
+    """Click the send control unless it is visibly disabled."""
     try:
         control = _send_control(driver)
         if control is None:
             return False
+        # Naukri carries the send class on the button itself, with no wrapper.
+        # Requiring that wrapper refused every click and left answers typed but
+        # unsent, so disabled state is read from the button and any wrapper.
         ancestors = control.find_elements(
             By.XPATH,
             "./ancestor::*[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
             "'abcdefghijklmnopqrstuvwxyz'),'send')]",
         )
-        if not ancestors:
-            logger.warning("Refusing to click send: no send-class ancestor was found")
+        classes = " ".join(
+            [control.get_attribute("class") or ""]
+            + [ancestor.get_attribute("class") or "" for ancestor in ancestors]
+        )
+        aria_disabled = (control.get_attribute("aria-disabled") or "").casefold()
+        if "disabled" in classes.casefold() or aria_disabled == "true":
+            logger.debug("Send control is disabled; leaving the answer unsent")
             return False
-        classes = " ".join(ancestor.get_attribute("class") or "" for ancestor in ancestors)
-        if "disabled" in classes.casefold():
+        if not control.is_enabled():
+            logger.debug("Send control is not enabled; leaving the answer unsent")
             return False
         control.click()
         return True
@@ -179,10 +201,21 @@ def handle_radio(driver: WebDriver, answer_engine: AnswerEngine) -> Optional[boo
     radios = container.find_elements(By.CSS_SELECTOR, _RADIOS)
     labels = container.find_elements(By.CSS_SELECTOR, _RADIO_LABELS)
     options = [" ".join(label.text.split()) for label in labels]
-    question = _latest_question(driver)
+    question = _latest_question(driver, _QUESTION_WAIT)
     resolution = answer_engine.resolve(question, options=options, field_type="radio")
     if resolution.abstained or resolution.answer is None:
         return None
+    # Resolving takes seconds - waiting for the question to paint, then an LLM
+    # call - and Naukri re-renders the drawer in that window, so any handle
+    # captured earlier is stale by now.
+    containers = _visible(driver.find_elements(By.CSS_SELECTOR, _RADIO_CONTAINER))
+    if not containers:
+        logger.error("Radio options disappeared while the answer was resolved")
+        return None
+    container = containers[0]
+    radios = container.find_elements(By.CSS_SELECTOR, _RADIOS)
+    labels = container.find_elements(By.CSS_SELECTOR, _RADIO_LABELS)
+    options = [" ".join(label.text.split()) for label in labels]
     wanted = _normalise(resolution.answer.text)
     for index, radio in enumerate(radios):
         label_text = options[index] if index < len(options) else ""
@@ -204,9 +237,16 @@ def handle_text(driver: WebDriver, answer_engine: AnswerEngine) -> Optional[bool
     text_area = find_chat_text_area(driver)
     if text_area is None:
         return False
-    question = _latest_question(driver)
+    question = _latest_question(driver, _QUESTION_WAIT)
     resolution = answer_engine.resolve(question, options=None, field_type="text")
     if resolution.abstained or resolution.answer is None:
+        return None
+    # Resolving takes seconds - waiting for the question to paint, then an LLM
+    # call - and Naukri re-renders the drawer in that window, so any handle
+    # captured earlier is stale by now.
+    text_area = find_chat_text_area(driver)
+    if text_area is None:
+        logger.error("Chatbot input disappeared while the answer was resolved")
         return None
     if not write_contenteditable(driver, text_area, resolution.answer.text):
         return None
@@ -230,10 +270,22 @@ def _handle_checkbox(driver: WebDriver, answer_engine: AnswerEngine) -> Optional
     if not controls:
         return False
     options = [_option_label(drawers[0], control) for control in controls]
-    question = _latest_question(driver)
+    question = _latest_question(driver, _QUESTION_WAIT)
     resolution = answer_engine.resolve(question, options=options, field_type="checkbox")
     if resolution.abstained or resolution.answer is None:
         return None
+    # Resolving takes seconds - waiting for the question to paint, then an LLM
+    # call - and Naukri re-renders the drawer in that window, so any handle
+    # captured earlier is stale by now.
+    drawers = _visible(driver.find_elements(By.CSS_SELECTOR, _DRAWER))
+    if not drawers:
+        logger.error("Chatbot drawer disappeared while the answer was resolved")
+        return None
+    controls = _visible(drawers[0].find_elements(By.CSS_SELECTOR, _CHECKBOXES))
+    if not controls:
+        logger.error("Checkbox options disappeared while the answer was resolved")
+        return None
+    options = [_option_label(drawers[0], control) for control in controls]
     wanted = _normalise(resolution.answer.text)
     for index, option in enumerate(options):
         if _normalise(option) != wanted:
@@ -257,9 +309,24 @@ def _handle_plain_text(driver: WebDriver, answer_engine: AnswerEngine) -> Option
     ]
     if not controls:
         return False
-    question = _latest_question(driver)
+    question = _latest_question(driver, _QUESTION_WAIT)
     resolution = answer_engine.resolve(question, options=None, field_type="text")
     if resolution.abstained or resolution.answer is None:
+        return None
+    # Resolving takes seconds - waiting for the question to paint, then an LLM
+    # call - and Naukri re-renders the drawer in that window, so any handle
+    # captured earlier is stale by now.
+    drawers = _visible(driver.find_elements(By.CSS_SELECTOR, _DRAWER))
+    if not drawers:
+        logger.error("Chatbot drawer disappeared while the answer was resolved")
+        return None
+    controls = [
+        element
+        for element in drawers[0].find_elements(By.CSS_SELECTOR, _PLAIN_INPUTS)
+        if element.is_displayed() and element.is_enabled()
+    ]
+    if not controls:
+        logger.error("Chatbot input disappeared while the answer was resolved")
         return None
     control = controls[0]
     control.clear()
@@ -342,8 +409,7 @@ def handle_chatbot(
                 human_pause(0.45, 1.1)
                 continue
 
-            no_input = current_state[2] == 0 and current_state[3] == 0 and current_state[4] == 0
-            if no_input and time.monotonic() - changed_at >= _STALL_TIMEOUT:
+            if time.monotonic() - changed_at >= _STALL_TIMEOUT:
                 return ChatbotOutcome(False, answered, 0, "stalled")
             human_pause(0.3, 0.75)
         except (NoSuchElementException, StaleElementReferenceException) as exc:
