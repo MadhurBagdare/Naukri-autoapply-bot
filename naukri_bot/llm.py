@@ -338,6 +338,8 @@ def resolve_answer(
         return _abstain(question, "llm_unavailable")
 
     facts = profile.known_facts()
+    if profile.resume_text:
+        facts["resume"] = profile.resume_text[:6000]
     request: Dict[str, Any] = {"facts": facts, "question": question}
     if options is not None:
         request["options"] = options
@@ -381,8 +383,10 @@ def resolve_answer(
 
     answer_text = answer_value.strip()
     if options is not None:
-        option_lookup = {_normalise_space(option): option for option in options}
-        matched_option = option_lookup.get(_normalise_space(answer_text))
+        option_lookup = {
+            _normalise_space(option).casefold(): option for option in options
+        }
+        matched_option = option_lookup.get(_normalise_space(answer_text).casefold())
         if matched_option is None:
             return _abstain(question, "llm_answer_not_in_options")
         answer_text = matched_option
