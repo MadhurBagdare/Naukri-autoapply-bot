@@ -51,9 +51,21 @@ class Ledger:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._migrate()
+            self._ensure_fingerprint_column()
         except sqlite3.Error:
             logger.exception("failed to open ledger database at %s", db_path)
             raise
+
+    def _ensure_fingerprint_column(self) -> None:
+        with self._lock, self._connection:
+            columns = {
+                row[1]
+                for row in self._connection.execute("PRAGMA table_info(answers)")
+            }
+            if "profile_fingerprint" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE answers ADD COLUMN profile_fingerprint TEXT"
+                )
 
     def _migrate(self) -> None:
         """Create the ledger schema if it does not already exist."""
@@ -81,7 +93,8 @@ class Ledger:
                         question_norm TEXT PRIMARY KEY, question_text TEXT,
                         answer TEXT, field_type TEXT, grounded_in TEXT,
                         source TEXT, confidence REAL, created_at TEXT,
-                        updated_at TEXT, times_used INTEGER DEFAULT 0
+                        updated_at TEXT, times_used INTEGER DEFAULT 0,
+                        profile_fingerprint TEXT
                     );
                     CREATE TABLE IF NOT EXISTS runs(
                         id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT,
@@ -250,16 +263,23 @@ class Ledger:
             logger.exception("failed to list recent applications")
             raise
 
-    def get_answer(self, question_text: str) -> Optional[Answer]:
+    def get_answer(
+        self, question_text: str, profile_fingerprint: Optional[str] = None
+    ) -> Optional[Answer]:
         question_norm = _normalise_question(question_text)
         try:
             with self._lock, self._connection:
                 row = self._connection.execute(
-                    """SELECT answer, grounded_in, confidence FROM answers
-                       WHERE question_norm = ?""",
+                    """SELECT answer, grounded_in, confidence, profile_fingerprint
+                       FROM answers WHERE question_norm = ?""",
                     (question_norm,),
                 ).fetchone()
                 if row is None:
+                    return None
+                if (
+                    profile_fingerprint is not None
+                    and row["profile_fingerprint"] != profile_fingerprint
+                ):
                     return None
                 self._connection.execute(
                     "UPDATE answers SET times_used = times_used + 1 WHERE question_norm = ?",
@@ -276,7 +296,11 @@ class Ledger:
             raise
 
     def save_answer(
-        self, question_text: str, answer: Answer, field_type: str = "text"
+        self,
+        question_text: str,
+        answer: Answer,
+        field_type: str = "text",
+        profile_fingerprint: Optional[str] = None,
     ) -> None:
         question_norm = _normalise_question(question_text)
         saved_at = _now()
@@ -285,8 +309,9 @@ class Ledger:
                 self._connection.execute(
                     """INSERT INTO answers(
                            question_norm, question_text, answer, field_type,
-                           grounded_in, source, confidence, created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           grounded_in, source, confidence, created_at,
+                           updated_at, profile_fingerprint
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(question_norm) DO UPDATE SET
                            question_text = excluded.question_text,
                            answer = excluded.answer,
@@ -294,11 +319,12 @@ class Ledger:
                            grounded_in = excluded.grounded_in,
                            source = excluded.source,
                            confidence = excluded.confidence,
-                           updated_at = excluded.updated_at""",
+                           updated_at = excluded.updated_at,
+                           profile_fingerprint = excluded.profile_fingerprint""",
                     (
                         question_norm, question_text, answer.text, field_type,
                         answer.grounded_in, answer.source, answer.confidence,
-                        saved_at, saved_at,
+                        saved_at, saved_at, profile_fingerprint,
                     ),
                 )
         except sqlite3.Error:

@@ -1,5 +1,7 @@
 """Fail-closed screening answer resolution."""
 
+import hashlib
+import json
 import logging
 import os
 from datetime import datetime
@@ -75,6 +77,12 @@ def _record_unanswered(question: str, reason: str, options=None) -> None:
         logger.warning("Could not write %s: %s", _UNANSWERED_FILE, exc)
 
 
+def _profile_fingerprint(profile: Profile) -> str:
+    payload = json.dumps(profile.known_facts(), sort_keys=True, default=str)
+    payload += profile.resume_text or ""
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
 class AnswerEngine:
     def __init__(
         self,
@@ -89,6 +97,7 @@ class AnswerEngine:
         self.settings = settings
         self.answered = 0
         self.abstained = 0
+        self.profile_fingerprint = _profile_fingerprint(profile)
 
     def resolve(
         self,
@@ -97,7 +106,7 @@ class AnswerEngine:
         field_type: str = "text",
     ) -> AnswerResolution:
         self._current_options = options
-        cached = self.ledger.get_answer(question)
+        cached = self.ledger.get_answer(question, self.profile_fingerprint)
         cached_answer = self._cached_answer(cached)
         if cached_answer is not None:
             if options is None or self._exact_option(cached_answer.text, options) is not None:
@@ -145,7 +154,9 @@ class AnswerEngine:
                 question, AnswerResolution.abstain("propose_mode"), False
             )
         if persist:
-            self.ledger.save_answer(question, answer, field_type)
+            self.ledger.save_answer(
+                question, answer, field_type, self.profile_fingerprint
+            )
         return self._finish(question, resolution, False)
 
     def _finish(
