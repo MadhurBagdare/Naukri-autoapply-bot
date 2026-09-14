@@ -1,6 +1,8 @@
 """Fail-closed screening answer resolution."""
 
 import logging
+import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from . import llm
@@ -29,6 +31,47 @@ def _number_text(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+_UNANSWERED_FILE = "unanswered_questions.md"
+_seen_unanswered = set()
+_unanswered_loaded = False
+
+
+def _record_unanswered(question: str, reason: str) -> None:
+    global _unanswered_loaded
+
+    key = " ".join(question.split()).casefold()
+    if not key or key == "unidentified chatbot question":
+        return
+
+    if not _unanswered_loaded:
+        _unanswered_loaded = True
+        try:
+            with open(_UNANSWERED_FILE, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("- ["):
+                        text = line.split("] ", 1)[-1].rsplit(" -- ", 1)[0]
+                        _seen_unanswered.add(" ".join(text.split()).casefold())
+        except OSError:
+            pass
+
+    if key in _seen_unanswered:
+        return
+    _seen_unanswered.add(key)
+
+    try:
+        with open(_UNANSWERED_FILE, "a", encoding="utf-8") as handle:
+            handle.write(
+                "- [%s] %s -- %s\n"
+                % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    " ".join(question.split()),
+                    reason,
+                )
+            )
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", _UNANSWERED_FILE, exc)
 
 
 class AnswerEngine:
@@ -112,6 +155,7 @@ class AnswerEngine:
                 logger.info(
                     "Abstaining from question %r: %s", question, resolution.reason
                 )
+            _record_unanswered(question, resolution.reason)
         else:
             self.answered += 1
         return resolution

@@ -37,6 +37,8 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+_EXTERNAL_JOBS_FILE = "external_jobs.md"
+
 EXIT_OK = 0
 EXIT_CONFIG = 1
 EXIT_LOGIN = 2
@@ -241,9 +243,46 @@ def derive_keywords(profile: Profile, settings: Settings) -> List[str]:
     return keywords
 
 
-def _report_plan(selected: List[ScoredJob], ranking_module: Any) -> None:
-    logger.info("--- application plan (%d jobs, best first) ---", len(selected))
-    for position, scored in enumerate(selected, start=1):
+def _write_external_jobs(jobs: List[ScoredJob]) -> None:
+    if not jobs:
+        return
+    try:
+        with open(_EXTERNAL_JOBS_FILE, "a", encoding="utf-8") as handle:
+            handle.write(
+                "\n## %s - %d roles that apply on the company site\n\n"
+                % (datetime.now().strftime("%Y-%m-%d %H:%M"), len(jobs))
+            )
+            handle.write("| score | role | company | posted | link |\n")
+            handle.write("|---|---|---|---|---|\n")
+            for scored in jobs:
+                handle.write(
+                    "| %.1f | %s | %s | %s | %s |\n"
+                    % (
+                        scored.score,
+                        scored.job.title or "-",
+                        scored.job.company or "-",
+                        scored.job.posted_label or "-",
+                        scored.job.url,
+                    )
+                )
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", _EXTERNAL_JOBS_FILE, exc)
+        return
+    logger.info(
+        "%d roles apply on the company site and need applying by hand; listed in %s",
+        len(jobs),
+        _EXTERNAL_JOBS_FILE,
+    )
+
+
+def _report_plan(selected: List[ScoredJob], ranking_module: Any, limit: int) -> None:
+    shown = selected[: max(0, limit)]
+    logger.info(
+        "--- application plan (%d shown of %d eligible, best first) ---",
+        len(shown),
+        len(selected),
+    )
+    for position, scored in enumerate(shown, start=1):
         logger.info(
             "%2d. [%5.1f] %s @ %s (%s)",
             position,
@@ -421,7 +460,7 @@ def run(
             summary.quota_after = ledger.quota_used()
             return summary
 
-        _report_plan(selected, ranking)
+        _report_plan(selected, ranking, settings.target_applications)
 
         if settings.dry_run:
             logger.info("Dry run: stopping before the first click.")
@@ -432,15 +471,23 @@ def run(
             ledger, client, profile, settings
         )
 
-        for position, scored in enumerate(selected, start=1):
+        external_jobs: List[ScoredJob] = []
+
+        for scored in selected:
+            if summary.applied >= settings.target_applications:
+                logger.info(
+                    "Reached the target of %d applications.",
+                    settings.target_applications,
+                )
+                break
             if ledger.quota_remaining(settings.daily_quota) <= 0:
                 logger.warning("Quota exhausted mid-run. Stopping cleanly.")
                 break
 
             logger.info(
-                "[%d/%d] %s @ %s",
-                position,
-                len(selected),
+                "[%d of %d applied] %s @ %s",
+                summary.applied,
+                settings.target_applications,
                 scored.job.title,
                 scored.job.company,
             )
@@ -451,12 +498,16 @@ def run(
             _tally(summary, result)
             logger.info("      -> %s (%s)", result.status, result.detail or "-")
 
+            if result.status == ApplyStatus.EXTERNAL_SKIPPED:
+                external_jobs.append(scored)
+
             if result.status in ApplyStatus.TERMINAL:
                 logger.warning(
                     "Naukri reports the daily quota is exhausted. Stopping."
                 )
                 break
 
+        _write_external_jobs(external_jobs)
         summary.quota_after = ledger.quota_used()
         return summary
 

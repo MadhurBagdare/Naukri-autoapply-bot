@@ -256,14 +256,14 @@ def select_for_application(
 
     logger.info(
         "Application selection dropped %d already applied, %d below min score, "
-        "%d older than max age, and %d over the quota cap; selected %d",
+        "and %d older than max age; %d eligible for a target of %d",
         dropped_applied,
         dropped_score,
         dropped_stale,
-        max(0, len(selected) - settings.target_applications),
-        min(len(selected), settings.target_applications),
+        len(selected),
+        settings.target_applications,
     )
-    return selected[: max(0, settings.target_applications)]
+    return selected
 
 
 def explain(scored: ScoredJob) -> str:
