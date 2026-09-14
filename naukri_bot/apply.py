@@ -238,6 +238,20 @@ def _result(
     )
 
 
+def _looks_logged_out(driver: WebDriver) -> bool:
+    try:
+        controls = driver.find_elements(
+            By.XPATH,
+            "//*[contains(translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+            "'continue with google')]",
+        )
+    except WebDriverException as exc:
+        logger.debug("Could not check the sign-in state: %s", exc)
+        return False
+    return any(control.is_displayed() for control in controls)
+
+
 def _reload_and_check_applied(driver: WebDriver, job: JobPosting) -> str:
     # Naukri never flips the apply container in place. Both confirmed
     # applications showed nothing for the full verification window, then
@@ -273,6 +287,9 @@ def apply_to_job(
             human_pause()
             if not safe_get(driver, job.url):
                 return _result(job, ApplyStatus.ERROR, "navigation_failed")
+
+        if _looks_logged_out(driver):
+            return _result(job, ApplyStatus.SESSION_EXPIRED, "signed out of Naukri")
 
         rendered = _wait_for_apply_controls(driver)
 

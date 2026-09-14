@@ -88,6 +88,7 @@ class ApplyStatus:
     ABSTAINED = "abstained"
     NO_APPLY_BUTTON = "no_apply_button"
     QUOTA_EXPIRED = "quota_expired"
+    SESSION_EXPIRED = "session_expired"
     CHATBOT_TIMEOUT = "chatbot_timeout"
     ERROR = "error"
 
@@ -95,7 +96,7 @@ class ApplyStatus:
     CONSUMES_QUOTA = (APPLIED,)
 
     #: Statuses that mean "stop the run immediately".
-    TERMINAL = (QUOTA_EXPIRED,)
+    TERMINAL = (QUOTA_EXPIRED, SESSION_EXPIRED)
 
 
 @dataclass

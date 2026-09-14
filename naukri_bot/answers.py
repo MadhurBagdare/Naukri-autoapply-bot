@@ -38,7 +38,7 @@ _seen_unanswered = set()
 _unanswered_loaded = False
 
 
-def _record_unanswered(question: str, reason: str) -> None:
+def _record_unanswered(question: str, reason: str, options=None) -> None:
     global _unanswered_loaded
 
     key = " ".join(question.split()).casefold()
@@ -63,11 +63,12 @@ def _record_unanswered(question: str, reason: str) -> None:
     try:
         with open(_UNANSWERED_FILE, "a", encoding="utf-8") as handle:
             handle.write(
-                "- [%s] %s -- %s\n"
+                "- [%s] %s -- %s%s\n"
                 % (
                     datetime.now().strftime("%Y-%m-%d %H:%M"),
                     " ".join(question.split()),
                     reason,
+                    " | options: %s" % (options,) if options else "",
                 )
             )
     except OSError as exc:
@@ -95,6 +96,7 @@ class AnswerEngine:
         options: Optional[List[str]] = None,
         field_type: str = "text",
     ) -> AnswerResolution:
+        self._current_options = options
         cached = self.ledger.get_answer(question)
         cached_answer = self._cached_answer(cached)
         if cached_answer is not None:
@@ -155,7 +157,9 @@ class AnswerEngine:
                 logger.info(
                     "Abstaining from question %r: %s", question, resolution.reason
                 )
-            _record_unanswered(question, resolution.reason)
+            _record_unanswered(
+                question, resolution.reason, getattr(self, "_current_options", None)
+            )
         else:
             self.answered += 1
         return resolution
